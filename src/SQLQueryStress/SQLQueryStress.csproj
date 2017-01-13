@@ -19,7 +19,7 @@
     <ManifestKeyFile>SQLQueryStress_TemporaryKey.pfx</ManifestKeyFile>
     <IsWebBootstrapper>false</IsWebBootstrapper>
     <ApplicationIcon>Resources\QueryStressIcon.ico</ApplicationIcon>
-    <TargetFrameworkVersion>v4.0</TargetFrameworkVersion>
+    <TargetFrameworkVersion>v4.5</TargetFrameworkVersion>
     <FileUpgradeFlags>
     </FileUpgradeFlags>
     <UpgradeBackupLocation>
@@ -156,6 +156,7 @@
     <Compile Include="SqlControl.xaml.cs">
       <DependentUpon>SqlControl.xaml</DependentUpon>
     </Compile>
+    <Compile Include="ThreadPoolSizer.cs" />
     <EmbeddedResource Include="AboutBox.resx">
       <SubType>Designer</SubType>
       <DependentUpon>AboutBox.cs</DependentUpon>

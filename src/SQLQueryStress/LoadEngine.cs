@@ -1,13 +1,18 @@
 #region
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Data;
 using System.Data.SqlClient;
 using System.Diagnostics;
+using System.Linq;
+using System.Runtime.Remoting.Messaging;
 using System.Text.RegularExpressions;
 using System.Threading;
+using System.Threading.Tasks;
+using System.Windows.Documents;
 
 #endregion
 
@@ -15,10 +20,8 @@ namespace SQLQueryStress
 {
     internal class LoadEngine
     {
-        private static readonly Queue<QueryOutput> QueryOutInfo = new Queue<QueryOutput>();
         private readonly bool _collectIoStats;
         private readonly bool _collectTimeStats;
-        private readonly List<SqlCommand> _commandPool = new List<SqlCommand>();
         private readonly int _commandTimeout;
 
         private readonly string _connectionString;
@@ -26,13 +29,11 @@ namespace SQLQueryStress
         private readonly int _iterations;
         private readonly string _paramConnectionString;
         private readonly Dictionary<string, string> _paramMappings;
-        //private readonly List<Queue<queryOutput>> queryOutInfoPool = new List<Queue<queryOutput>>();        
         private readonly string _paramQuery;
         private readonly string _query;
-        private readonly List<Thread> _threadPool = new List<Thread>();
         private readonly int _threads;
         private int _queryDelay;
-
+        
         public LoadEngine(string connectionString, string query, int threads, int iterations, string paramQuery, Dictionary<string, string> paramMappings,
             string paramConnectionString, int commandTimeout, bool collectIoStats, bool collectTimeStats, bool forceDataRetrieval)
         {
@@ -78,11 +79,19 @@ namespace SQLQueryStress
             StartLoad(worker);
         }
 
-        [System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Security", "CA2100:Review SQL queries for security vulnerabilities")]
+        [System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Security",
+            "CA2100:Review SQL queries for security vulnerabilities")]
         private void StartLoad(BackgroundWorker worker)
         {
-            var useParams = false;
+            var queryOutInfo = new BlockingCollection<QueryOutput>();
+            var cancellationTokenSource = new CancellationTokenSource();
+            var queryInputs = new List<QueryInput>();
+            var taskPool = new List<Task>();
 
+            // resize threadpool
+            var threadPoolSizer = new ThreadPoolSizer(_threads);
+
+            var useParams = false;
             var badParams = new List<string>();
             foreach (var theKey in _paramMappings.Keys)
             {
@@ -104,161 +113,136 @@ namespace SQLQueryStress
                 useParams = true;
             }
 
-            //Initialize the connection pool            
-            var conn = new SqlConnection(_connectionString);
-            //TODO: use this or not??
-            SqlConnection.ClearPool(conn);
-            conn.Open();
-            conn.Dispose();
+            // Clear all existing connections
+            SqlConnection.ClearAllPools();
 
-            //make sure the run cancelled flag is not set
-            QueryInput.RunCancelled = false;
+            // fill the connection pool up to the "right" size, so that threads/tasks aren't waiting to open and handshake with SQL.
+            Task.WaitAll(PopulateConnectionPool(_connectionString, _threads));
 
-            //Spin up the load threads
+            // Spin up the load threads
             for (var i = 0; i < _threads; i++)
             {
-                conn = new SqlConnection(_connectionString);
+                var conn = new SqlConnection(_connectionString);
 
                 //TODO: Figure out how to make this option work (maybe)
                 //conn.FireInfoMessageEventOnUserErrors = true;
 
-                SqlCommand statsComm = null;
-
-                var queryComm = new SqlCommand {CommandTimeout = _commandTimeout, Connection = conn, CommandText = _query};
+                var queryComm = new SqlCommand
+                {
+                    CommandTimeout = _commandTimeout,
+                    Connection = conn,
+                    CommandText = _query
+                };
 
                 if (useParams)
                 {
                     queryComm.Parameters.AddRange(ParamServer.GetParams());
                 }
 
-                var setStatistics = (_collectIoStats ? @"SET STATISTICS IO ON;" : "") + (_collectTimeStats ? @"SET STATISTICS TIME ON;" : "");
+                var setStatistics = (_collectIoStats ? @"SET STATISTICS IO ON;" : "") +
+                                    (_collectTimeStats ? @"SET STATISTICS TIME ON;" : "");
 
+                SqlCommand statsComm = null;
                 if (setStatistics.Length > 0)
                 {
-                    statsComm = new SqlCommand {CommandTimeout = _commandTimeout, Connection = conn, CommandText = setStatistics};
+                    statsComm = new SqlCommand
+                    {
+                        CommandTimeout = _commandTimeout,
+                        Connection = conn,
+                        CommandText = setStatistics
+                    };
                 }
 
-                //Queue<queryOutput> queryOutInfo = new Queue<queryOutput>();
-
-                var input = new QueryInput(statsComm, queryComm,
-//                    this.queryOutInfo,
+                var input = new QueryInput(conn, statsComm, queryComm,
                     _iterations, _forceDataRetrieval, _queryDelay);
+                queryInputs.Add(input);
 
-                var theThread = new Thread(input.StartLoadThread) {Priority = ThreadPriority.BelowNormal};
-
-                _threadPool.Add(theThread);
-                _commandPool.Add(queryComm);
-                //queryOutInfoPool.Add(queryOutInfo);
+                var theThread = input.StartLoadThread(queryOutInfo, cancellationTokenSource.Token);
+                taskPool.Add(theThread);
             }
 
-            //Start the load threads
-            for (var i = 0; i < _threads; i++)
+            // event reader task, will be cancelled by the blockingcollection being completed.
+            var eventReader = new Task(() => ProcessEventQueue(worker, taskPool, queryOutInfo), CancellationToken.None,
+                TaskCreationOptions.LongRunning | TaskCreationOptions.DenyChildAttach);
+            eventReader.Start();
+
+            // bit horrible, but we wake up every second to check if we've been cancelled
+            // TODO: Can this be event driven, as the event only needs to set the cancellation token
+            while (!Task.WaitAll(taskPool.ToArray(), TimeSpan.FromSeconds(1)))
             {
-                _threadPool[i].Start();
-            }
-
-            //Start reading the queue...
-            var finishedThreads = 0;
-            var cancelled = false;
-
-            while (finishedThreads < _threads)
-            {
-//                for (int i = 0; i < threads; i++)
-//                {
-                // try
-                // {
-                QueryOutput theOut = null;
-                //lock (queryOutInfoPool[i])
-                lock (QueryOutInfo)
+                if (worker.CancellationPending)
                 {
-                    //if (queryOutInfoPool[i].Count > 0)
-                    //theOut = (queryOutput)queryOutInfoPool[i].Dequeue();
-                    if (QueryOutInfo.Count > 0)
-                        theOut = QueryOutInfo.Dequeue();
-                    else
-                        Monitor.Wait(QueryOutInfo);
-                }
-
-                if (theOut != null)
-                {
-                    //Report output to the UI
-                    worker.ReportProgress((int) (finishedThreads / (decimal) _threads * 100), theOut);
-
-                    //TODO: Make this actually remove the queue from the pool so that it's not checked again -- maintain this with a bitmap, perhaps?
-                    if (theOut.Finished)
-                        finishedThreads++;
-                }
-                /* }
-                    catch (InvalidOperationException e)
-                    {
-                    }
-                    */
-
-                /*
-                        if (theOut != null)
-                            Thread.Sleep(200);
-                        else
-                            Thread.Sleep(10);
-                     */
-                //               }
-
-                //TODO: Remove this ?
-                GC.Collect();
-
-                if (worker.CancellationPending && !cancelled)
-                {
-                    QueryInput.RunCancelled = true;
-
-                    //First, kill connections as fast as possible
-                    SqlConnection.ClearAllPools();
-
-                    //for each 20 threads, create a new thread dedicated
-                    //to killing them
-                    var threadNum = _threadPool.Count;
-
-                    var killerThreads = new List<Thread>();
-                    while (threadNum > 0)
-                    {
-                        var i = threadNum <= 20 ? 0 : threadNum - 20;
-
-                        var killThreads = new Thread[threadNum - i < 1 ? threadNum : threadNum - i];
-                        var killCommands = new SqlCommand[threadNum - i < 1 ? threadNum : threadNum - i];
-
-                        _threadPool.CopyTo(i, killThreads, 0, killThreads.Length);
-                        _commandPool.CopyTo(i, killCommands, 0, killCommands.Length);
-
-                        for (var j = threadNum - 1; j >= i; j--)
-                        {
-                            _threadPool.RemoveAt(j);
-                            _commandPool.RemoveAt(j);
-                        }
-
-                        var kill = new ThreadKiller(killThreads, killCommands);
-                        var killer = new Thread(kill.KillEm);
-                        killer.Start();
-                        Thread.Sleep(0);
-
-                        killerThreads.Add(killer);
-
-                        threadNum = i;
-                    }
-
-                    //wait for the kill threads to return
-                    //before exiting...
-                    foreach (var theThread in killerThreads)
-                    {
-                        theThread.Join();
-                    }
-
-                    cancelled = true;
+                    cancellationTokenSource.Cancel();
+                    Task.WaitAll(taskPool.ToArray());
                 }
             }
 
-            //clear any remaining messages -- these are almost certainly
-            //execeptions due to thread cancellation
-            //queryOutInfo.Clear();
+            // TODO: all this clean up should really happen finally/using blocks
+            // mark the event queue as complete, which will make the eventreader exit.
+            queryOutInfo.CompleteAdding();
+
+            // wait for the event reader to finish processing
+            Task.WaitAll(eventReader);
+
+            // clean up the query input objects
+            foreach (var disposable in queryInputs)
+                disposable.Dispose();
+
+            threadPoolSizer.Dispose();
+            if (useParams)
+                ParamServer.Uninitialize();
+
+            // free up memory back to the system
+            GC.Collect(2, GCCollectionMode.Forced);
         }
 
+        private void ProcessEventQueue(BackgroundWorker worker, ICollection<Task> taskPool, BlockingCollection<QueryOutput> queryOutInfo)
+        {
+            foreach (var theOut in queryOutInfo.GetConsumingEnumerable())
+            {
+                var finishedThreads = taskPool.Count(task => task.IsCompleted);
+                worker.ReportProgress((int) (finishedThreads / (decimal) _threads * 100), theOut);
+            }
+        }
+
+        private static async Task PopulateConnectionPool(string connectionString, int poolSize)
+        {
+            var sqlConnOpenConnections = new List<SqlConnection>(poolSize);
+            var sqlConnOpenTasks = new List<Task>(30); 
+            try
+            {
+                for (var i = 0; i < poolSize; i++)
+                {
+                    var sqlConn = new SqlConnection(connectionString);
+                    sqlConnOpenConnections.Add(sqlConn);
+                    sqlConnOpenTasks.Add(sqlConnOpenConnections[i].OpenAsync());
+
+                    if (sqlConnOpenTasks.Count == 30)
+                    {
+                        // open connections in blocks of 30, otherwise some will timeout and need retries
+                        await Task.WhenAll(sqlConnOpenTasks);
+                        sqlConnOpenTasks.Clear();
+                    }
+                }
+                await Task.WhenAll(sqlConnOpenTasks);
+            }
+            catch (Exception e)
+            {
+                
+            }
+            try
+            {
+                foreach (var connection in sqlConnOpenConnections)
+                {
+                    if (connection?.State == ConnectionState.Open)
+                        connection.Close();
+                }
+            }
+            catch (Exception e)
+            {
+
+            }
+        }
 
         //TODO: Monostate pattern to be investigated (class is never instantiated)
         private class ParamServer
@@ -322,13 +306,17 @@ namespace SQLQueryStress
                     i++;
                 }
             }
+
+            public static void Uninitialize()
+            {
+                _theParams?.Clear();
+                _theParams?.Dispose();
+                _theParams = null;
+            }           
         }
 
-        private class QueryInput
+        private class QueryInput : IDisposable
         {
-            [ThreadStatic] private static QueryOutput _outInfo;
-
-            private static bool _runCancelled;
             //This regex is used to find the number of logical reads
             //in the messages collection returned in the queryOutput class
             private static readonly Regex FindReads = new Regex(@"(?:Table \'\w{1,}\'. Scan count \d{1,}, logical reads )(\d{1,})", RegexOptions.Compiled);
@@ -340,41 +328,34 @@ namespace SQLQueryStress
                     @"(?:SQL Server Execution Times:|SQL Server parse and compile time:)(?:\s{1,}CPU time = )(\d{1,})(?: ms,\s{1,}elapsed time = )(\d{1,})",
                     RegexOptions.Compiled);
 
+            private readonly SqlConnection _sqlConnection;
             private readonly SqlCommand _queryComm;
-
             private readonly SqlCommand _statsComm;
-
-            //private static Dictionary<int, List<string>> theInfoMessages = new Dictionary<int, List<string>>();
-
+            
             private readonly Stopwatch _sw = new Stopwatch();
             private readonly bool _forceDataRetrieval;
-            //          private readonly Queue<queryOutput> queryOutInfo;
             private readonly int _iterations;
             private readonly int _queryDelay;
 
-            public QueryInput(SqlCommand statsComm, SqlCommand queryComm,
-//                Queue<queryOutput> queryOutInfo,
-                int iterations, bool forceDataRetrieval, int queryDelay)
+            public QueryInput(SqlConnection conn, SqlCommand statsComm, SqlCommand queryComm, int iterations, bool forceDataRetrieval, int queryDelay)
             {
+                _sqlConnection = conn;
                 _statsComm = statsComm;
                 _queryComm = queryComm;
-//                this.queryOutInfo = queryOutInfo;
                 _iterations = iterations;
                 _forceDataRetrieval = forceDataRetrieval;
                 _queryDelay = queryDelay;
-
-                //Prepare the infoMessages collection, if we are collecting statistics
-                //if (stats_comm != null)
-                //    theInfoMessages.Add(stats_comm.Connection.GetHashCode(), new List<string>());
             }
 
-            public static bool RunCancelled
+            public void Dispose()
             {
-                set { _runCancelled = value; }
+                _queryComm?.Dispose();
+                _statsComm?.Dispose();
+                _sqlConnection?.Dispose();
             }
 
-            private static void GetInfoMessages(object sender, SqlInfoMessageEventArgs args)
-            {
+            private static void GetInfoMessages(object sender, SqlInfoMessageEventArgs args, QueryOutput outInfo)
+            {   
                 foreach (SqlError err in args.Errors)
                 {
                     var matches = FindReads.Split(err.Message);
@@ -382,7 +363,7 @@ namespace SQLQueryStress
                     //we have a read
                     if (matches.Length > 1)
                     {
-                        _outInfo.LogicalReads += Convert.ToInt32(matches[1]);
+                        outInfo.LogicalReads += Convert.ToInt32(matches[1]);
                         continue;
                     }
 
@@ -391,151 +372,96 @@ namespace SQLQueryStress
                     //we have times
                     if (matches.Length > 1)
                     {
-                        _outInfo.CpuTime += Convert.ToInt32(matches[1]);
-                        _outInfo.ElapsedTime += Convert.ToInt32(matches[2]);
+                        outInfo.CpuTime += Convert.ToInt32(matches[1]);
+                        outInfo.ElapsedTime += Convert.ToInt32(matches[2]);
                     }
                 }
             }
 
-            [System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Usage", "CA2202:Do not dispose objects multiple times")]
-            public void StartLoadThread()
+            public async Task StartLoadThread(BlockingCollection<QueryOutput> queryOutInfo,
+                CancellationToken cancellationToken)
             {
-                try
+                for (var i = 0; i < _iterations; i++)
                 {
-                    //do the work
-                    using (var conn = _queryComm.Connection)
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    Exception outException = null;
+                    var outInfo = new QueryOutput();
+                    SqlInfoMessageEventHandler handler = (sender, args) => GetInfoMessages(sender, args, outInfo);
+                    try
                     {
-                        SqlInfoMessageEventHandler handler = GetInfoMessages;
-
-                        for (var i = 0; i < _iterations; i++)
+                        if (_sqlConnection.State != ConnectionState.Open)
                         {
-                            if (_runCancelled)
-                                throw new Exception();
+                            // to save cpu burn with lots of tasks/threads it's expected that the connection is held open
+                            await _sqlConnection.OpenAsync(cancellationToken).ConfigureAwait(false);
 
-                            Exception outException = null;
-
-                            try
+                            // set up the statistics gathering
+                            if (_statsComm != null)
                             {
-                                //initialize the outInfo structure
-                                _outInfo = new QueryOutput();
+                                await _statsComm.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                            }
+                        }
 
-                                if (conn != null)
+                        if (_statsComm != null)
+                            _sqlConnection.InfoMessage += handler;
+
+                        //Params are assigned only once -- after that, their values are dynamically retrieved
+                        if (_queryComm.Parameters.Count > 0)
+                        {
+                            ParamServer.GetNextRow_Values(_queryComm.Parameters);
+                        }
+
+                        _sw.Restart();
+
+                        //TODO: This could be made better
+                        if (_forceDataRetrieval)
+                        {
+                            using (
+                                var reader =
+                                    await _queryComm.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
+                            {
+                                do
                                 {
-                                    conn.Open();
-
-                                    //set up the statistics gathering
-                                    if (_statsComm != null)
+                                    while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                                     {
-                                        _statsComm.ExecuteNonQuery();
-                                        Thread.Sleep(0);
-                                        conn.InfoMessage += handler;
+                                        //grab the first column to force the row down the pipe
+                                        var x = reader[0];
                                     }
-                                }
-
-                                //Params are assigned only once -- after that, their values are dynamically retrieved
-                                if (_queryComm.Parameters.Count > 0)
-                                {
-                                    ParamServer.GetNextRow_Values(_queryComm.Parameters);
-                                }
-
-                                _sw.Start();
-
-                                //TODO: This could be made better
-                                if (_forceDataRetrieval)
-                                {
-                                    var reader = _queryComm.ExecuteReader();
-                                    Thread.Sleep(0);
-
-                                    do
-                                    {
-                                        Thread.Sleep(0);
-
-                                        while (reader.Read())
-                                        {
-                                            //grab the first column to force the row down the pipe
-                                            // ReSharper disable once UnusedVariable
-                                            var x = reader[0];
-                                            Thread.Sleep(0);
-                                        }
-                                    } while (reader.NextResult());
-                                }
-                                else
-                                {
-                                    _queryComm.ExecuteNonQuery();
-                                    Thread.Sleep(0);
-                                }
-
-                                _sw.Stop();
+                                } while (await reader.NextResultAsync(cancellationToken).ConfigureAwait(false));
                             }
-                            catch (Exception e)
-                            {
-                                if (_runCancelled)
-                                    throw;
-                                else
-                                    outException = e;
-
-                                if (_sw.IsRunning)
-                                {
-                                    _sw.Stop();
-                                }
-                            }
-                            finally
-                            {
-                                //Clean up the connection
-                                if (_statsComm != null && conn != null)
-                                    conn.InfoMessage -= handler;
-                                conn?.Close();
-                            }
-
-                            var finished = i == _iterations - 1;
-
-                            //List<string> infoMessages = null;
-
-                            //infoMessages = (stats_comm != null) ? theInfoMessages[connectionHashCode] : null;
-
-                            /*
-                            queryOutput theout = new queryOutput(
-                                outException,
-                                sw.Elapsed,
-                                finished,
-                                (infoMessages == null || infoMessages.Count == 0) ? null : infoMessages.ToArray());
-                             */
-
-                            _outInfo.E = outException;
-                            _outInfo.Time = _sw.Elapsed;
-                            _outInfo.Finished = finished;
-
-                            lock (QueryOutInfo)
-                            {
-                                QueryOutInfo.Enqueue(_outInfo);
-                                Monitor.Pulse(QueryOutInfo);
-                            }
-
-                            //Prep the collection for the next round
-                            //if (infoMessages != null && infoMessages.Count > 0)
-                            //    infoMessages.Clear();
-
-                            _sw.Reset();
-
-                            Thread.Sleep(_queryDelay);
                         }
-                    }
-                }
-                catch
-                {
-                    if (_runCancelled)
-                    {
-                        //queryOutput theout = new queryOutput(null, new TimeSpan(0), true, null);
-                        _outInfo.Time = new TimeSpan(0);
-                        _outInfo.Finished = true;
-
-                        lock (QueryOutInfo)
+                        else
                         {
-                            QueryOutInfo.Enqueue(_outInfo);
+                            await _queryComm.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
                         }
+
+                        _sw.Stop();
                     }
-                    else
+                    catch (TaskCanceledException)
+                    {
                         throw;
+                    }
+                    catch (Exception e)
+                    {
+                        outException = e;
+                        _sw.Stop();
+                        _sqlConnection.Close();
+                    }
+                    finally
+                    {
+                        if (_statsComm != null)
+                            _sqlConnection.InfoMessage -= handler;
+                    }
+
+                    outInfo.E = outException;
+                    outInfo.Time = _sw.Elapsed;
+
+                    // make sure we store any result, rather than losing it if cancelled
+                    queryOutInfo.Add(outInfo, CancellationToken.None);
+
+                    var finished = i == _iterations - 1;
+                    if (!finished && _queryDelay > 0)
+                        await Task.Delay(_queryDelay, cancellationToken).ConfigureAwait(false);
                 }
             }
         }
@@ -545,64 +471,8 @@ namespace SQLQueryStress
             public int CpuTime;
             public Exception E;
             public int ElapsedTime;
-            public bool Finished;
             public int LogicalReads;
             public TimeSpan Time;
-
-            /*
-            public queryOutput(
-                Exception e, 
-                TimeSpan time, 
-                bool finished,
-                string[] infoMessages)
-            {
-                this.e = e;
-                this.time = time;
-                this.finished = finished;
-                this.infoMessages = infoMessages;
-            }
-             */
-        }
-
-        private class ThreadKiller
-        {
-            private readonly SqlCommand[] _theCommands;
-            private readonly Thread[] _theThreads;
-
-            public ThreadKiller(Thread[] theThreads, SqlCommand[] theCommands)
-            {
-                _theThreads = theThreads;
-                _theCommands = theCommands;
-            }
-
-            public void KillEm()
-            {
-                foreach (var comm in _theCommands)
-                {
-                    comm.Cancel();
-                    comm.Connection.Dispose();
-                    comm.Connection = null;
-                    comm.Dispose();
-                    Thread.Sleep(0);
-                }
-
-                var keepKilling = true;
-
-                while (keepKilling)
-                {
-                    keepKilling = false;
-
-                    foreach (var theThread in _theThreads)
-                    {
-                        if (theThread.IsAlive)
-                        {
-                            keepKilling = true;
-                            theThread.Abort();
-                            Thread.Sleep(0);
-                        }
-                    }
-                }
-            }
         }
     }
 }
