@@ -8,11 +8,9 @@ using System.Data;
 using System.Data.SqlClient;
 using System.Diagnostics;
 using System.Linq;
-using System.Runtime.Remoting.Messaging;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Windows.Documents;
 
 #endregion
 
@@ -192,6 +190,9 @@ namespace SQLQueryStress
             if (useParams)
                 ParamServer.Uninitialize();
 
+            // Clear all existing connections
+            SqlConnection.ClearAllPools();
+
             // free up memory back to the system
             GC.Collect(2, GCCollectionMode.Forced);
         }
@@ -351,6 +352,7 @@ namespace SQLQueryStress
             {
                 _queryComm?.Dispose();
                 _statsComm?.Dispose();
+                _sqlConnection?.Close();
                 _sqlConnection?.Dispose();
             }
 
